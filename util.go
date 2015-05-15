@@ -3,13 +3,12 @@ package main
 import (
 	"crypto/tls"
 	"net/http"
-	"os"
 	"time"
 )
 
-func BreakArgsBySeparator() (left, right []string) {
+func BreakArgsBySeparator(args []string) (left, right []string) {
 	seenSeparator := false
-	for _, param := range os.Args[1:] {
+	for _, param := range args {
 		if param == "--" {
 			seenSeparator = true
 			continue

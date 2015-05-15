@@ -6,12 +6,19 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"syscall"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+
+	"github.com/codegangsta/cli"
 	"github.com/olekukonko/tablewriter"
 
+	"github.com/awslabs/aws-sdk-go/aws"
 	"github.com/awslabs/aws-sdk-go/service/ec2"
 )
 
@@ -57,15 +64,26 @@ func GetInstanceFromUser(max int) int {
 	return n
 }
 
-func InvokeSSH(instance *Instance) {
-	fmt.Fprintln(os.Stderr, "Connecting to", instance.Name())
+func InvokeSSH(cliArgs cli.Args, bastion string, instance *Instance, n int) {
+	fmt.Fprintf(os.Stderr, "\n-- [ Connecting to %v (%v:%v) ] --\n\n",
+		instance.PrivateIP, instance.Name(), n)
 
 	args := []string{"/usr/bin/ssh"}
+
+	if bastion != "" {
+		format := `ProxyCommand=ssh %v %v %%h %%p`
+		netCat := "ncat" // TODO(pwaller): automatically determine netcat binary
+		proxyCommand := fmt.Sprintf(format, bastion, netCat)
+		args = append(args, "-o", proxyCommand)
+	}
+
 	// Enable the user to specify arguments to the left and right of the host.
-	left, right := BreakArgsBySeparator()
-	args = append(args, left...)
+	// left, right := BreakArgsBySeparator(cliArgs)
+	// args = append(args, left...)
 	args = append(args, instance.PrivateIP)
-	args = append(args, right...)
+	args = append(args, cliArgs...)
+
+	log.Printf("exec: %q", args)
 
 	err := syscall.Exec("/usr/bin/ssh", args, os.Environ())
 	if err != nil {
@@ -80,7 +98,7 @@ func ClearToEndOfScreen() {
 	fmt.Fprint(os.Stderr, "[", "J")
 }
 
-func JumpTo(client *ec2.EC2) {
+func JumpTo(c *cli.Context, bastion string, client *ec2.EC2) {
 
 	ec2Instances, err := client.DescribeInstances(&ec2.DescribeInstancesInput{})
 	if err != nil {
@@ -93,13 +111,16 @@ func JumpTo(client *ec2.EC2) {
 	instances := InstancesFromEC2Result(ec2Instances)
 	ShowInstances(instances)
 
-	n := GetInstanceFromUser(len(instances))
+	n := c.Int("n")
+	if !c.IsSet("n") {
+		n = GetInstanceFromUser(len(instances))
+	}
 
 	// +1 to account for final newline.
 	CursorUp(len(instances) + N_TABLE_DECORATIONS + 1)
 	ClearToEndOfScreen()
 
-	InvokeSSH(instances[n])
+	InvokeSSH(c.Args(), bastion, instances[n], n)
 }
 
 func Watch(client *ec2.EC2) {
@@ -145,17 +166,109 @@ func Watch(client *ec2.EC2) {
 
 const N_TABLE_DECORATIONS = 4
 
+func addAgentAuth(auths []ssh.AuthMethod) []ssh.AuthMethod {
+	if sock := os.Getenv("SSH_AUTH_SOCK"); len(sock) > 0 {
+		if agconn, err := net.Dial("unix", sock); err == nil {
+			ag := agent.NewClient(agconn)
+			auths = append(auths, ssh.PublicKeysCallback(ag.Signers))
+		}
+	}
+	return auths
+}
+
+func LoadKey() (ssh.Signer, error) {
+	fd, err := os.Open(os.ExpandEnv("$HOME/.ssh/id_rsa"))
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	pemBytes, err := ioutil.ReadAll(fd)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Got %v pembytes", len(pemBytes))
+
+	return ssh.ParsePrivateKey(pemBytes)
+}
+
 func main() {
-	if os.Getenv("SSH_AUTH_SOCK") == "" {
-		fmt.Fprintln(os.Stderr, "[41;1mWarning: agent forwarding not enabled[K[m")
+	app := cli.NewApp()
+
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:   "bastion, b",
+			Usage:  "bastion host to use",
+			EnvVar: "JUMP_BASTION",
+			Value:  "<unset>",
+		},
+		cli.IntFlag{
+			Name:  "instance-index, n",
+			Usage: "go straight to host n",
+		},
 	}
 
-	client := ec2.New(nil)
+	app.Action = func(c *cli.Context) {
+		auths := []ssh.AuthMethod{}
+		auths = addAgentAuth(auths)
 
-	if len(os.Args) > 1 && os.Args[1] == "@" {
-		Watch(client)
-		return
+		config := &ssh.ClientConfig{}
+		config.SetDefaults()
+
+		config.User = "pwaller"
+		config.Auth = auths
+
+		bastion := c.String("bastion")
+
+		// TODO(pwaller): configurable SSH port
+		conn, err := ssh.Dial("tcp", bastion+":22", config)
+		if err != nil {
+			log.Fatalf("Failed to connect to bastion %q: %v", bastion, err)
+		}
+
+		t := &http.Transport{
+			// Use the ssh connection to dial remotes
+			Dial: conn.Dial,
+		}
+
+		http.DefaultClient.Transport = t
+
+		region, err := ThisRegion()
+		if err != nil {
+			log.Fatalln("Unable to determine bastion region")
+		}
+
+		awsConfig := *aws.DefaultConfig
+		awsConfig.HTTPClient = http.DefaultClient
+		awsConfig.Region = region
+
+		client := ec2.New(&awsConfig)
+
+		JumpTo(c, bastion, client)
 	}
 
-	JumpTo(client)
+	app.Commands = []cli.Command{
+		{
+			Name: "bastion",
+			Action: func(c *cli.Context) {
+				log.Printf("Foo!")
+			},
+		},
+	}
+
+	app.RunAndExitOnError()
+	return
+
+	// if os.Getenv("SSH_AUTH_SOCK") == "" {
+	// 	fmt.Fprintln(os.Stderr, "[41;1mWarning: agent forwarding not enabled[K[m")
+	// }
+
+	// client := ec2.New(nil)
+
+	// if len(os.Args) > 1 && os.Args[1] == "@" {
+	// 	Watch(client)
+	// 	return
+	// }
+
+	// JumpTo("", client)
 }
